@@ -30,7 +30,7 @@ const (
 	servingCertSecretAnnotation = "service.alpha.openshift.io/serving-cert-secret-name"
 
 	// ServingCertCreatePkcs12Annotation ...
-	servingCertCreatePkcs12Annotation = "paas.redhat.com/serving-cert-create-pkcs12"
+	servingCertCreatePkcs12Annotation = "ykoer.github.com/serving-cert-create-pkcs12"
 
 	tlsSecretCert               = "tls.crt"
 	tlsSecretKey                = "tls.key"
