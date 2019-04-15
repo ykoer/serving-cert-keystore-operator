@@ -2,16 +2,19 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
+	"io"
+	"strconv"
+	"strings"
 
-	paasv1alpha1 "gitlab.corp.redhat.com/ykoer/serving-cert-keystore-operator/pkg/apis/paas/v1alpha1"
+	pkcs12 "github.com/ykoer/serving-cert-keystore-operator/pkg/pkcs12"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -20,6 +23,20 @@ import (
 )
 
 var log = logf.Log.WithName("controller_service")
+
+const (
+	// ServingCertSecretAnnotation Annotation used to inform the certificate generation service to
+	// generate a cluster-signed certificate and populate the secret.
+	servingCertSecretAnnotation = "service.alpha.openshift.io/serving-cert-secret-name"
+
+	// ServingCertCreatePkcs12Annotation ...
+	servingCertCreatePkcs12Annotation = "paas.redhat.com/serving-cert-create-pkcs12"
+
+	tlsSecretCert               = "tls.crt"
+	tlsSecretKey                = "tls.key"
+	tlsPkcs12SecretFileName     = "tls.p12"
+	tlsPkcs12SecretPasswordName = "tls-pkcs12-password"
+)
 
 /**
 * USER ACTION REQUIRED: This is a scaffold file intended for the user to modify with their own Controller
@@ -46,17 +63,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	// Watch for changes to primary resource Service
-	err = c.Watch(&source.Kind{Type: &paasv1alpha1.Service{}}, &handler.EnqueueRequestForObject{})
-	if err != nil {
-		return err
-	}
-
-	// TODO(user): Modify this to be the types you create that are owned by the primary resource
-	// Watch for changes to secondary resource Pods and requeue the owner Service
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
-		IsController: true,
-		OwnerType:    &paasv1alpha1.Service{},
-	})
+	err = c.Watch(&source.Kind{Type: &corev1.Service{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
@@ -86,7 +93,7 @@ func (r *ReconcileService) Reconcile(request reconcile.Request) (reconcile.Resul
 	reqLogger.Info("Reconciling Service")
 
 	// Fetch the Service instance
-	instance := &paasv1alpha1.Service{}
+	instance := &corev1.Service{}
 	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -99,54 +106,74 @@ func (r *ReconcileService) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
+	secretName := instance.ObjectMeta.Annotations[servingCertSecretAnnotation]
+	createPkcs12, _ := strconv.ParseBool(instance.ObjectMeta.Annotations[servingCertCreatePkcs12Annotation])
 
-	// Set Service instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
+	reqLogger.Info("Secret: " + secretName + ", Create Keystore: " + strconv.FormatBool(createPkcs12))
 
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
-	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+	if len(secretName) > 0 {
+		request.Name = secretName
+		secret := &corev1.Secret{}
+		err := r.client.Get(context.TODO(), request.NamespacedName, secret)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
-	} else if err != nil {
-		return reconcile.Result{}, err
+		// remove pkc12 keystore and password
+		if !createPkcs12 && len(secret.Data[tlsPkcs12SecretFileName]) > 0 {
+			r.removeServingCertSecretKeystore(secret)
+			reqLogger.Info("Keystore removed!")
+		}
+
+		// create the pkcs12 keystore using the auto-generated crt and key
+		if createPkcs12 && len(secret.Data[tlsPkcs12SecretFileName]) == 0 {
+			r.createServingCertSecretKeystore(secret)
+			reqLogger.Info("Keystore created!")
+		}
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *paasv1alpha1.Service) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
+func (r *ReconcileService) removeServingCertSecretKeystore(secret *corev1.Secret) (reconcile.Result, error) {
+	delete(secret.Data, tlsPkcs12SecretFileName)
+	delete(secret.Data, tlsPkcs12SecretPasswordName)
+	err := r.client.Update(context.TODO(), secret)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
-				},
-			},
-		},
+
+	// Secret updated successfully
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileService) createServingCertSecretKeystore(secret *corev1.Secret) (reconcile.Result, error) {
+	// create a random password
+	password, err := getRandomPassword()
+	if err != nil {
+		return reconcile.Result{}, err
 	}
+
+	// create the pkcs12 keystore using the auto-generated crt and key
+	pfxData, err := pkcs12.CreatePkcs12(secret.Data[tlsSecretCert], secret.Data[tlsSecretKey], password)
+
+	secret.Data[tlsPkcs12SecretFileName] = pfxData
+	secret.Data[tlsPkcs12SecretPasswordName] = []byte(password)
+
+	err = r.client.Update(context.TODO(), secret)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// Secret updated successfully
+	return reconcile.Result{}, nil
+}
+
+func getRandomPassword() (string, error) {
+	b := make([]byte, 16)
+	_, err := io.ReadFull(rand.Reader, b)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(base32.StdEncoding.EncodeToString(b), "="), nil
 }

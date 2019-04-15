@@ -1,7 +1,7 @@
 package controller
 
 import (
-	"gitlab.corp.redhat.com/ykoer/serving-cert-keystore-operator/pkg/controller/service"
+	"github.com/ykoer/serving-cert-keystore-operator/pkg/controller/service"
 )
 
 func init() {
