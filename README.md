@@ -1,5 +1,5 @@
 # serving-cert-keystore-operator
-An Operator which extends "service.alpha.openshift.io/serving-cert-secret-name" annotation to to create a keystore
+An Operator which extends "service.alpha.openshift.io/serving-cert-secret-name" annotation with a PKCS12 keystore option.
 
 # Example
 
